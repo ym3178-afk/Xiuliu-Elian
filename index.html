@@ -6188,22 +6188,9 @@ function localExplain(text){
   return `Core meaning: ${summary}\n\nReading cue: ${cues.join('；')}. In context, verify the key concepts, supporting claims, and how this passage relates to what comes before and after.`;
 }
 async function translateSelectedText(text){
-  const controller=new AbortController();
-  const timer=setTimeout(()=>controller.abort(),6500);
-  try{
-    const url='https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q='+encodeURIComponent(text);
-    const res=await fetch(url,{signal:controller.signal});
-    if(!res.ok)throw new Error('translate http '+res.status);
-    const data=await res.json();
-    const translated=(data?.[0]||[]).map(x=>x?.[0]||'').join('').trim();
-    if(translated)return translated;
-    throw new Error('empty translation');
-  }catch(err){
-    // Offline/local fallback: preserve the original text and make the state explicit.
-    return `[Offline translation fallback] The browser cannot reach the online translation service.\n\n${text}`;
-  }finally{
-    clearTimeout(timer);
-  }
+  // Reuse the same reliable engine as full-page translation so selected text
+  // does not depend on the blocked translate.googleapis.com browser endpoint.
+  return translateParagraphZH(text);
 }
 function showSelectionResult(kind,quote,result,pageNo,loading=false){
   setRight('assistant');
@@ -6425,6 +6412,10 @@ $$('#selectionToolbar [data-sel-action]').forEach(btn=>btn.onclick=async e=>{
 
 /* Right panel */
 function setRight(mode){
+  // Chrome's built-in Translator.create() must be initiated from a user gesture
+  // when its language pack is not downloaded yet. Start it immediately from
+  // the Translate nav click, before any async PDF work can consume activation.
+  if(mode==='translate')primeTranslationEngineFromGesture();
   currentRight=mode;
   if($('#readerBody').classList.contains('panelClosed'))document.documentElement.style.setProperty('--panel','48vw');
   $('#readerBody').classList.remove('panelClosed');
@@ -8833,559 +8824,44 @@ function translationParagraphs(text){
   return parts.slice(0,8);
 }
 async function translateParagraphZH(text){
-  if(!text)return '';
-  try{
-    const c=new AbortController(), timer=setTimeout(()=>c.abort(),6500);
-    const u='https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q='+encodeURIComponent(text);
-    const r=await fetch(u,{signal:c.signal}); clearTimeout(timer);
-    if(!r.ok)throw new Error('translate');
-    const j=await r.json();
-    const out=(j?.[0]||[]).map(x=>x?.[0]||'').join('');
-    if(out.trim())return out.trim();
-  }catch(e){}
-  return 'Translation service is temporarily unavailable. No fake translation will be generated; source text and page navigation still work.';
-}
-function renderTranslate(){
-  $('#panelTitle').textContent='Chinese Translation';
-  const current=Math.max(1,page||1);
-  const selected=(selectedReaderText||'').trim();
-  const selectedPage=selectedReaderPage||current;
-
-  $('#panelContent').innerHTML=`
-    <div class="bilingualWorkspace">
-      <header class="bilingualHeader">
-        <div class="bilingualHeaderTop"><span class="agentV2Badge">BILINGUAL READING</span><span class="translationSync">● Synced with PDF reading position</span></div>
-        <h2>Bilingual Paper Reading</h2>
-        <p>Current Page <b id="translationCurrentPage">${current}</b> · Translations remain linked to PDF pages and source evidence</p>
-      </header>
-
-      <div class="translationControls">
-        <div class="translationSegment" id="translationViewMode">
-          <button data-view="zh">Chinese Only</button><button class="active" data-view="dual">Source + Chinese</button>
-        </div>
-        <div class="translationSegment" id="translationScope">
-          <button class="active" data-scope="page">current page</button><button data-scope="section">Current Section</button><button data-scope="all">Full Paper</button>
-        </div>
-      </div>
-
-      ${selected?`
-        <section class="selectedTranslationBox">
-          <div class="selectedTranslationHead"><span>Current selection · P.${selectedPage}</span><button id="clearTranslationSelection">×</button></div>
-          <div class="translationOriginal"><label>Source</label><p>${safeText(selected)}</p></div>
-          <div class="translationChinese"><label>Chinese</label><p class="translationPending" data-translate-text="${safeText(selected)}">Translating…</p></div>
-          <button class="translationLocate" data-page="${selectedPage}" data-text="${safeText(excerpt(selected,120))}">P.${selectedPage} · Locate source →</button>
-        </section>`:''}
-
-      <div id="translationReadingBody" class="translationReadingBody"></div>
-    </div>`;
-
-  const state={view:'dual',scope:'page',renderPage:current};
-  $$('#translationViewMode button').forEach(b=>b.onclick=()=>{
-    state.view=b.dataset.view;
-    $$('#translationViewMode button').forEach(x=>x.classList.toggle('active',x===b));
-    $('#translationReadingBody').classList.toggle('zhOnly',state.view==='zh');
-  });
-  $$('#translationScope button').forEach(b=>b.onclick=()=>{
-    state.scope=b.dataset.scope;
-    $$('#translationScope button').forEach(x=>x.classList.toggle('active',x===b));
-    renderBilingualScope(state);
-  });
-  $('#clearTranslationSelection')?.addEventListener('click',()=>{
-    selectedReaderText=''; selectedReaderRange=null;
-    renderTranslate();
-  });
-  bindTranslationLocate();
-  hydrateTranslations($('#panelContent'));
-  renderBilingualScope(state);
-}
-async function renderBilingualScope(state){
-  const host=$('#translationReadingBody'); if(!host)return;
-  const total=activePaper?.pdfDoc?.numPages||activePaper?.pageCount||activePaper?.pages||1;
-  const current=Math.max(1,page||1);
-  $('#translationCurrentPage').textContent=current;
-
-  let pagesToShow=[current];
-  if(state.scope==='section'){
-    pagesToShow=[current-1,current,current+1].filter(p=>p>=1&&p<=total);
-  }else if(state.scope==='all'){
-    const candidates=[];
-    for(let p=current;p<=Math.min(total,current+7);p++)candidates.push(p);
-    for(let p=Math.max(1,current-2);p<current;p++)candidates.unshift(p);
-    pagesToShow=candidates.slice(0,10);
-  }
-
-  let blocks=[];
-  for(const pg of pagesToShow){
-    let text=translationPageText(activePaper,pg);
-    if(isLowValueTranslationText(text) && pg!==current)continue;
-    const paras=translationParagraphs(text);
-    if(!paras.length && pg===current)paras.push(text||'No translatable text was extracted from the current page.');
-    paras.forEach((p,i)=>blocks.push({page:pg,text:p,index:i}));
-  }
-
-  host.innerHTML=blocks.length?blocks.map((x,i)=>`
-    <article class="bilingualParagraph">
-      <div class="bilingualMeta"><span>P.${x.page} · ${x.page===current?'current page':'Paper source'}</span><span>${String(i+1).padStart(2,'0')}</span></div>
-      <div class="translationOriginal"><label>Source</label><p>${safeText(x.text)}</p></div>
-      <div class="translationChinese"><label>Chinese</label><p class="translationPending" data-translate-text="${safeText(x.text)}">Translating…</p></div>
-      <button class="translationLocate" data-page="${x.page}" data-text="${safeText(excerpt(x.text,120))}">P.${x.page} · Locate source →</button>
-    </article>`).join(''):
-    `<div class="translationEmpty"><b>No translatable body text on this page</b><p>Copyright pages, publication metadata, and other low-value text were filtered. Continue to a body-text page.</p></div>`;
-
-  $('#translationReadingBody').classList.toggle('zhOnly',state.view==='zh');
-  bindTranslationLocate();
-  hydrateTranslations(host);
-}
-function bindTranslationLocate(){
-  $$('.translationLocate').forEach(btn=>{
-    if(btn.dataset.bound)return;
-    btn.dataset.bound='1';
-    btn.onclick=()=>{
-      const pg=+btn.dataset.page||1, text=btn.dataset.text||'';
-      navigateToPdfPage(pg,{text});
-      toast(`Located P.${pg}`);
-    };
-  });
-}
-async function hydrateTranslations(root){
-  if(!root)return;
-  const nodes=[...root.querySelectorAll('.translationPending')];
-  for(const node of nodes){
-    if(node.dataset.loading)return;
-    node.dataset.loading='1';
-    const text=node.dataset.translateText||'';
-    node.textContent=await translateParagraphZH(text);
-    node.classList.remove('translationPending');
-  }
-}
-
-/* ===== Article-grounded assistant override =====
-   The original chat fallback returned the same TL;DR for every unmatched
-   question. This local assistant now indexes the active paper, classifies the
-   request, ranks matching sentences, and renders answer-specific evidence. */
-function assistantQuestionIntent(question,context=''){
-  const q=normalizePaperText(question).toLowerCase();
-  if(context&&/选Medium|这段|这句话|这句|什么意思|解释|含义|meaning|explain/.test(q))return 'selection';
-  if(/Translate|译成Chinese|英文怎么说|translate|translation/.test(q))return 'translation';
-  if(/刚才|上面|前面|上述|这个结论|这项研究|它为什么|Ask a follow-up|follow.?up/.test(q))return 'followup';
-  if(/作者是谁|作者信息|作者的背景|author|Title|题目|Paper名|发表|年份|哪一年|who wrote|title/.test(q))return 'metadata';
-  if(/比较|区别|不同|关系|联系|相比|对照|compare|difference|versus|\s+vs\s+|relationship|contrast/.test(q))return 'compare';
-  if(/Research Question|研究目的|想解决|核心问题|研究假设|假设|hypothesis|research question|aim|objective|purpose/.test(q))return 'question';
-  if(/Method|怎么做|如何研究|Research Design|数据|样本|实验|变量|模型|流程|步骤|method|dataset|sample|experiment|procedure|measure|model/.test(q))return 'method';
-  if(/Results|发现|结论|证明|表明|显示|说明了什么|findings?|results?|conclusion|show|demonstrate/.test(q))return 'results';
-  if(/局限|不足|缺点|问题在哪里|风险|批评|限制|未来工作|limitation|weakness|risk|caution|future work/.test(q))return 'limitations';
-  if(/创新|Contribution|新意|新在哪里|原创|突破|novel|contribution|original|advance/.test(q))return 'contribution';
-  if(/引用|Evidence|Source|出处|依据|哪一页|支持|evidence|cite|citation|source/.test(q))return 'evidence';
-  if(/意义|影响|启发|应用|Why it matters|so what|implication|impact|relevant/.test(q))return 'implication';
-  if(/什么是|是什么意思|如何理解|定义|概念|define|meaning|term/.test(q))return 'definition';
-  if(/Summarize|概括|讲了什么|Topic|核心内容|摘要|summary|overview|about|main idea/.test(q))return 'overview';
-  return 'retrieval';
-}
-function assistantQueryCore(question){
-  return normalizePaperText(question||'').toLowerCase()
-    .replace(/This paper |这篇文章|Current paper|Current文章|作者|请问|请|帮我|告诉我|可以|什么|如何|为什么|是否|哪些|有没有|Current|上面|前面|刚才|这个|这项|它|一下|解释|说明/g,' ')
-    .replace(/\s+/g,' ').trim();
-}
-function assistantCjkTerms(question){
-  const raw=assistantQueryCore(question),out=[];
-  const domain=['Research Question','研究目的','研究假设','Method','Research Design','数据','样本','实验','变量','模型','流程','Results','发现','结论','局限','不足','风险','未来工作','创新','Contribution','新意','Evidence','Source','引用','意义','影响','应用','概念','定义','原因','机制','关系','比较','案例','理论','框架','适用范围','反驳'];
-  domain.forEach(term=>{if(raw.includes(term))out.push(term)});
-  const chunks=raw.match(/[\u4e00-\u9fff]{2,12}/g)||[];
-  chunks.forEach(chunk=>{
-    if(chunk.length<=6)out.push(chunk);
-    for(let i=0;i<chunk.length-1&&out.length<18;i++){
-      const gram=chunk.slice(i,i+2);
-      if(!/^(作者|Paper|文章|帮我|告诉|可以|如何|为什么|什么|是否|Current|上面|前面|这个|这项|解释|说明)$/.test(gram))out.push(gram);
-    }
-  });
-  return [...new Set(out)].slice(0,24);
-}
-function assistantQuestionTerms(question,intent){
-  const q=String(question||'').toLowerCase();
-  const tokens=q.match(/[a-z][a-z0-9-]{1,}|[\u4e00-\u9fff]{2,}/g)||[];
-  const stop=new Set(['This paper ','这篇文章','Current paper','Current文章','作者','Paper','文章','请问','可以','帮我','告诉我','什么','如何','为什么','是否','哪些','有没有','这个','这项','上面','前面','刚才','the','this','paper','what','how','why','does','作者的','Current']);
-  const intentTerms={
-    selection:['meaning','explain','context','解释','语境'],
-    question:['research question','aim','objective','purpose','question','hypothesis','Research Question','研究目的','研究假设','假设'],
-    method:['method','methodology','data','dataset','sample','case','experiment','survey','interview','procedure','measure','model','Method','数据','样本','实验','变量','模型','Research Design'],
-    results:['result','results','find','found','finding','show','demonstrate','conclude','conclusion','Results','发现','结论'],
-    limitations:['limitation','however','future work','constraint','challenge','caution','cannot','risk','局限','不足','限制','未来工作'],
-    contribution:['contribution','novel','propose','introduce','framework','gap','advance','original','创新','Contribution','新意'],
-    evidence:['evidence','claim','support','argue','according','Evidence','Source','引用','出处','依据'],
-    compare:['compare','difference','versus','relationship','contrast','比较','区别','关系','不同'],
-    implication:['implication','impact','relevant','application','future','意义','影响','应用'],
-    overview:['abstract','introduction','question','result','contribution','摘要','引言','概览'],
-    definition:['definition','meaning','concept','refers','定义','概念','含义'],
-    translation:['translate','translation','Translate','译文'],
-    retrieval:[]
-  };
-  const english=tokens.filter(t=>/^[a-z]/.test(t)&&t.length>=2&&!stop.has(t));
-  const chinese=tokens.filter(t=>/[\u4e00-\u9fff]/.test(t)&&t.length>=2&&!stop.has(t));
-  return [...new Set([...english,...chinese,...assistantCjkTerms(question),...(intentTerms[intent]||[])])];
-}
-function assistantSearchRows(paper,terms,count=5,options={}){
-  const rows=[];
-  const question=normalizePaperText(options.question||'').toLowerCase();
-  const core=assistantQueryCore(question);
-  const cjk=[...new Set(assistantCjkTerms(question).filter(x=>x.length>=2))];
-  const attachedPage=+options.attachedPage||0;
-  const pages=Object.keys(paper?.pageTexts||{}).map(Number).filter(Number.isFinite).sort((a,b)=>a-b);
-  if(!pages.length&&paper?.extractedText)pages.push(1);
-  pages.forEach(pg=>{
-    const text=normalizePaperText(paper?.pageTexts?.[pg]|| (pg===1?paper?.extractedText||'':''));
-    if(!text||isLowValueTranslationText?.(text))return;
-    meaningfulSentences(text).forEach(sentence=>{
-      const low=sentence.toLowerCase();
-      let score=scoreSentence(sentence,terms);
-      let matched=!terms.length;
-      terms.forEach(term=>{
-        const value=String(term||'').toLowerCase().trim();
-        if(value&&low.includes(value)){score+=value.length>3?3.4:1.6;matched=true}
-      });
-      if(core&&core.length>2&&low.includes(core)){score+=10;matched=true}
-      if(cjk.length){
-        const overlap=cjk.reduce((n,term)=>n+(low.includes(term.toLowerCase())?1:0),0);
-        if(overlap){score+=Math.min(7,overlap*1.35);matched=true}
-      }
-      if(attachedPage&&pg===attachedPage)score+=2.25;
-      if(matched&&score>0)rows.push({page:pg,sentence,score});
-    });
-  });
-  rows.sort((a,b)=>b.score-a.score||a.page-b.page);
-  const out=[],seen=new Set();
-  rows.forEach(row=>{
-    const key=articleSentenceKey(row.sentence);
-    if(!key||seen.has(key)||out.length>=count)return;
-    seen.add(key);out.push(row);
-  });
-  return out;
-}
-function assistantEvidenceRows(paper,question,intent,state){
-  const terms=assistantQuestionTerms(question,intent);
-  const limit=state?.mode==='deep'?7:5;
-  let rows=assistantSearchRows(paper,terms,limit,{question,attachedPage:state?.attachedPage});
-  const context=(state?.attachedSelection||'').trim();
-  const attachedPage=+state?.attachedPage||0;
-  if(context){
-    const contextKey=articleSentenceKey(context);
-    const contextMatch=Object.keys(paper?.pageTexts||{}).map(Number).sort((a,b)=>a-b).map(pg=>({page:pg,text:normalizePaperText(paper.pageTexts[pg]||'')})).find(x=>x.text&&contextKey&&x.text.toLowerCase().includes(contextKey.slice(0,80)));
-    rows=[{page:contextMatch?.page||attachedPage||1,sentence:context,score:100,matchType:'selection'},...rows];
-  }
-  if(attachedPage&&paper?.pageTexts?.[attachedPage]){
-    const pageRows=assistantSearchRows({...paper,pageTexts:{[attachedPage]:paper.pageTexts[attachedPage]}},terms,state?.mode==='deep'?4:3,{question,attachedPage});
-    rows=[...pageRows,...rows.filter(x=>x.page!==attachedPage)];
-  }
-  if(!rows.length){
-    const source=currentPaperRuntime(paper).source||{};
-    const sourceKey={question:'rq',method:'method',results:'finding',limitations:'limitation',contribution:'contribution',definition:'finding',implication:'contribution',overview:'finding',evidence:'finding'}[intent];
-    const fallback=sourceKey&&Array.isArray(source[sourceKey])?source[sourceKey]:[];
-    rows=fallback.slice(0,limit).map(x=>({page:x.page,sentence:x.sentence,score:1,matchType:'structured'}));
-  }
-  const section={question:'Research Question',method:'Method',results:'Finding',limitations:'Limitation',contribution:'Contribution',implication:'Implication',overview:'PDF Overview',definition:'Definition',translation:'Translation',selection:'Selected Text'}[intent]||'PDF Evidence';
-  const seen=new Set();
-  return rows.filter(x=>{const key=`${x.page}|${articleSentenceKey(x.sentence)}`;if(seen.has(key))return false;seen.add(key);return true}).slice(0,limit).map((x,i)=>({id:i+1,page:x.page,section:x.matchType==='selection'?'Selected Text':section,text:x.sentence,score:x.score||0,matchType:x.matchType||'text'}));
-}
-/* The final chat answerer is intentionally evidence-first. It supersedes the
-   older demo answerer above while keeping the existing structured panel intact. */
-function assistantDynamicAnswerData(question,state){
-  const paper=activePaper;
-  const f=currentPaperRuntime(paper);
-  const context=(state?.attachedSelection||'').trim();
-  const history=Array.isArray(state?.history)?state.history:[];
-  const previous=[...history].reverse().find(x=>x.role==='user')?.question||'';
-  let intent=assistantQuestionIntent(question,context);
-  let effectiveQuestion=question;
-  if(intent==='followup'){
-    effectiveQuestion=[previous,question].filter(Boolean).join(' ');
-    intent=assistantQuestionIntent(previous||question,context);
-    if(intent==='followup')intent='retrieval';
-  }
-  const ev=assistantEvidenceRows(paper,effectiveQuestion,intent,state);
-  const shown=state?.mode==='deep'?5:3;
-  const excerpts=ev.slice(0,shown).map((x,i)=>'Source evidence '+(i+1)+' (P.'+x.page+'): '+excerpt(x.text,240)).join('\n');
-  const title=paperDisplayTitle(paper)||'Current paper';
-  const directEvidence=ev.filter(x=>x.matchType!=='structured').length;
-  const noEvidence='I could not find a source sentence in the current PDF that directly matches this question. I will not fill the gap with an unrelated summary; add a keyword, section, or page number.';
-  const evidenceText=excerpts||noEvidence;
-  const pages=[...new Set(ev.map(x=>x.page).filter(Boolean))];
-  const confidence=directEvidence>=2?'High':directEvidence===1?'Medium':ev.length?'Low':'None';
-  const evidenceSentence=ev[0]?.text||'';
-  let heading='Source-Grounded Answer';
-  let main='';
-  let why='';
-  let inspire='';
-  if(intent==='metadata'){
-    heading='Paper Information';
-    main='The current paper is “'+title+'”. '+(paper?.author?'Authors: '+paper.author+'. ':'No explicit author field was extracted from the PDF. ')+(paper?.year?'Year: '+paper.year+'.':'');
-    if(evidenceSentence)main+='\n\nRelated source text: '+excerpt(evidenceSentence,260);
-    why='This answer first checks the current file’s title, author, and year metadata, then uses source text for verification so information from other papers is not mixed in.';
-    inspire='Ask where the author information appears in the paper and I can return locatable source evidence.';
-  }else if(intent==='selection'){
-    heading='Selected-Text Analysis';
-    main=context?localExplain(context):noEvidence;
-    if(evidenceSentence&&articleSentenceKey(evidenceSentence)!==articleSentenceKey(context))main+='\n\nIn the context of the full paper: '+excerpt(evidenceSentence,240);
-    why='The selected text is used as the primary context, and any cited page comes from the actual PDF page containing the selection.';
-    inspire='You can ask how this passage relates to the research question, methodology, or conclusions.';
-  }else if(intent==='translation'){
-    heading='Translation Guidance';
-    main=context?('Meaning of the selected source text:\n'+localExplain(context)):(evidenceSentence?('The source most relevant to this translation request is:\n'+excerpt(evidenceSentence,360)):noEvidence);
-    why='Translation questions use only the current selection or real text from the current PDF. For a full page, section, or full paper translated into Chinese, use the Chinese Translation panel to avoid truncation in chat.';
-    inspire='For paragraph-level translation, specify the current page or section, or paste the passage you want translated.';
-  }else if(intent==='question'){
-    heading='Research Question';
-    main=ev.length?'The paper’s research question or objective is supported by these passages:\n'+evidenceText:noEvidence;
-    why='The answer is restricted to PDF passages related to the research question, objective, or hypothesis; an abstract is not substituted when there is no match.';
-    inspire='Next, ask why the authors chose this question and what research gap it addresses.';
-  }else if(intent==='method'){
-    heading='Methodology';
-    main=ev.length?'Methodological information is supported by these passages:\n'+evidenceText:noEvidence;
-    why='The PDF is searched for method, data, sample, experiment, procedure, and related terms, while preserving the page number for every piece of evidence.';
-    inspire='You can ask about the sample, variables, data sources, experimental procedure, or methodological limitations.';
-  }else if(intent==='results'){
-    heading='Results & Conclusions';
-    main=ev.length?'The results most relevant to “'+excerpt(question,80)+'” are:\n'+evidenceText:noEvidence;
-    why='The response uses source passages containing result, find, show, demonstrate, conclusion, and related signals and retains their PDF page numbers.';
-    inspire='Before citing, verify the sample, conditions, and qualifiers attached to each result.';
-  }else if(intent==='limitations'){
-    heading='Limitations & Risks';
-    main=ev.length?'The paper provides the following evidence relevant to limitations or risks:\n'+evidenceText:noEvidence;
-    why='The search prioritizes limitation, constraint, caution, future work, however, and related contexts rather than treating generic criticism as a limitation of this paper.';
-    inspire='These limitations can be tested as candidates for follow-up research questions or research gaps.';
-  }else if(intent==='contribution'){
-    heading='Novelty & Contribution';
-    main=ev.length?'Claims about novelty or contribution are supported by these sources:\n'+evidenceText:noEvidence;
-    why='The search prioritizes contribution, novel, framework, gap, advance, and related source language. Confidence remains low when the PDF does not provide direct evidence.';
-    inspire='You can ask for a concrete comparison with the paper’s related work.';
-  }else if(intent==='evidence'){
-    heading='Source Evidence';
-    main='For “'+excerpt(question,100)+'”, the most relevant evidence in the current PDF is:\n'+evidenceText;
-    why='Each item preserves the real PDF page number. “Locate source” jumps to that page and highlights the matching text when the PDF text layer is available.';
-    inspire='When citing, preserve the surrounding context rather than quoting a single sentence in isolation.';
-  }else if(intent==='compare'){
-    heading='Relationship & Comparison';
-    main=ev.length?'The current paper provides the following comparison evidence related to “'+excerpt(question,100)+'”:\n'+evidenceText:noEvidence;
-    why='The answer combines comparison signals with concepts in your question across relevant pages instead of returning a fixed summary.';
-    inspire='Provide another paper or a specific concept and I can continue with a point-by-point comparison.';
-  }else if(intent==='implication'){
-    heading='Implications';
-    main=ev.length?'The implications of this research should be interpreted using the following evidence about its problem, contribution, or application:\n'+evidenceText:noEvidence;
-    why='The response relies on source text about significance, impact, contribution, or application instead of asserting that the work is important without evidence.';
-    inspire='A useful next step is to verify the scope and limitations of the methodology.';
-  }else if(intent==='overview'){
-    heading='Paper Overview';
-    main=ev.length?'The main thread that can be confirmed from the current PDF is:\n'+evidenceText:noEvidence;
-    why='The overview searches signals from the abstract, introduction, research question, results, and contribution. It does not present a fixed TL;DR as a complete summary when evidence is insufficient.';
-    inspire='Specify methodology, results, novelty, or a term from the paper for a more precise answer.';
-  }else if(intent==='definition'){
-    heading='Concept Explanation';
-    main=ev.length?'In this paper, the concept should be understood in the context of these passages:\n'+evidenceText:noEvidence;
-    why='The response searches for the term in the paper’s own context rather than relying on a generic dictionary definition.';
-    inspire='Ask how this concept is used in the paper’s methodology or results.';
-  }else{
-    heading='Source-Grounded Answer';
-    main=ev.length?'For “'+excerpt(question,120)+'”, the most relevant content in the current paper is:\n'+evidenceText:noEvidence;
-    why=ev.length?'Found '+ev.length+' relevant source item(s) from '+pages.map(x=>'P.'+x).join(', ')+'. Confidence: '+confidence+'.':'The current PDF does not contain enough matching evidence, so no conclusion was invented.';
-    inspire='Add a keyword, section, or page number and I can broaden the retrieval range.';
-  }
-  return {heading,main,why,inspire,ev,mode:state?.mode||'quick',intent,confidence,evidencePages:pages,followups:[
-    intent==='method'?'Where do the sample and data come from?':
-    intent==='results'?'What conditions or qualifiers limit this result?':
-    intent==='limitations'?'How could these limitations become a new research question?':
-    intent==='contribution'?'How exactly does this differ from prior work?':
-    intent==='selection'?'How does this passage relate to the paper’s conclusions?':
-    'Show me more source evidence supporting this answer.'
-  ]};
-}
-
-async function runPaperChatAnswer(q,state){
-  const root=$('#assistantConversation');if(!root)return;
-  const id='paper-chat-'+Date.now()+'-'+Math.random().toString(36).slice(2,6);
-  root.insertAdjacentHTML('beforeend',`<div class="chatTurn aiTurn" id="${id}"><div class="chatRole">AI</div><div class="chatThinking"><i></i>${state.mode==='deep'?'Reading the full text and comparing relevant evidence…':'Searching relevant passages in the current paper…'}</div></div>`);
-  root.scrollTop=root.scrollHeight;
-  const wait=state.mode==='deep'?260:120;
-  setTimeout(async()=>{
-    const node=document.getElementById(id);if(!node)return;
-    try{
-      if(activePaper?.pdfDoc)await ensureArticleContext(activePaper);
-      const d=assistantDynamicAnswerData(q,state);
-      assistantChatHistory.push({role:'assistant',heading:d.heading,answer:d.main,evidence:d.ev||[],paperId:activePaper?.id||activePaper?.title||'mock',source:activePaper?.title||'Current paper',createdAt:'Just now'});
-      const used=(d.ev||[]).slice(0,state.mode==='deep'?4:2);
-      node.innerHTML=`<div class="chatRole">AI · ${safeText(d.heading)}</div><div class="chatAIText" style="white-space:pre-wrap">${safeText(d.main)}</div>${used.map((e,i)=>`<div class="chatEvidence"><div class="chatEvidenceHead"><b>Source evidence ${i+1}</b><span>p.${e.page} · ${safeText(e.section||'PDF')}</span></div><p>“${safeText(excerpt(e.text,220))}”</p><button class="evidenceLocate" data-evidence-page="${e.page}" data-evidence-text="${safeText(excerpt(e.text,120))}">Locate source →</button></div>`).join('')}${state.mode==='deep'?`<div class="deepAnalysisNote"><b>Basis for answer</b><p>${safeText(d.why)} ${safeText(d.inspire)}</p></div>`:''}<div class="chatAnswerActions"><button class="chatFollowup">Ask a follow-up</button><button class="chatSaveNote">Save to AI Notes</button></div>`;
-      bindEvidenceButtons(node);
-      node.querySelector('.chatFollowup')?.addEventListener('click',()=>$('#askInput')?.focus());
-      node.querySelector('.chatSaveNote')?.addEventListener('click',()=>{noteItems.unshift({type:'AI Notes',title:`AI Q&A · ${d.heading}`,text:d.main,quote:used.map((e,i)=>`[${i+1}] P.${e.page} ${excerpt(e.text,100)}`).join('\n'),page:used[0]?.page||page||1,source:activePaper?.title||'Current paper',paperId:activePaper?.id||'mock',evidence:used,createdAt:'Just now'});toast('✓ Saved to AI Notes')});
-      root.scrollTop=root.scrollHeight;
-    }catch(err){
-      node.innerHTML=`<div class="chatRole">AI</div><div class="chatAIText">Failed to read the current PDF. No unverified answer was generated. Try again later.</div>`;
-      console.warn('assistant answer failed',err);
-    }
-  },wait);
-}
-
-/* Conversation-aware chat renderer. It keeps recent turns, exposes evidence
-   confidence, and makes every citation actionable instead of hiding the basis
-   of the answer behind a generic “AI” bubble. */
-async function runPaperChatAnswer(q,state){
-  const root=$('#assistantConversation');if(!root)return;
-  const id='paper-chat-'+Date.now()+'-'+Math.random().toString(36).slice(2,6);
-  const thinking=state?.mode==='deep'?'Reading the full text and comparing relevant evidence…':'Searching relevant passages in the current paper…';
-  root.insertAdjacentHTML('beforeend','<div class="chatTurn aiTurn" id="'+id+'"><div class="chatRole">AI</div><div class="chatThinking"><i></i>'+thinking+'</div></div>');
-  root.scrollTop=root.scrollHeight;
-  const wait=state?.mode==='deep'?260:120;
-  setTimeout(async()=>{
-    const node=document.getElementById(id);if(!node)return;
-    try{
-      if(activePaper?.pdfDoc)await ensureArticleContext(activePaper);
-      const key=activePaper?.id||activePaper?.title||'mock';
-      const history=assistantChatHistory.filter(x=>(x.paperId||x.source)===key||x.source===activePaper?.title).slice(-9);
-      const prior=history.length&&history[history.length-1]?.role==='user'&&history[history.length-1]?.question===q?history.slice(0,-1):history;
-      const d=assistantDynamicAnswerData(q,Object.assign({},state,{history:prior}));
-      assistantChatHistory.push({role:'assistant',heading:d.heading,answer:d.main,evidence:d.ev||[],confidence:d.confidence,intent:d.intent,paperId:key,source:activePaper?.title||'Current paper',createdAt:'Just now'});
-      const used=(d.ev||[]).slice(0,state?.mode==='deep'?5:3);
-      let html='<div class="chatRole">AI · '+safeText(d.heading)+' <span class="chatConfidence">Evidence confidence: '+safeText(d.confidence||'None')+'</span></div>';
-      html+='<div class="chatAIText" style="white-space:pre-wrap">'+safeText(d.main)+'</div>';
-      if(!used.length)html+='<div class="chatNoEvidence"><b>No direct evidence</b><span>Add a term, section, or page number and ask again.</span></div>';
-      used.forEach((e,i)=>{
-        html+='<div class="chatEvidence"><div class="chatEvidenceHead"><b>Source evidence '+(i+1)+'</b><span>p.'+e.page+' · '+safeText(e.section||'PDF')+'</span></div><p>“'+safeText(excerpt(e.text,240))+'”</p><button class="evidenceLocate" data-evidence-page="'+e.page+'" data-evidence-text="'+safeText(excerpt(e.text,140))+'">Locate source →</button></div>';
-      });
-      html+='<div class="deepAnalysisNote"><b>Basis for answer</b><p>'+safeText(d.why)+'</p><p>'+safeText(d.inspire)+'</p></div>';
-      if(Array.isArray(d.followups)&&d.followups.length){
-        html+='<div class="chatSuggestedFollowups"><span>Suggested follow-ups: </span>'+d.followups.map(x=>'<button class="chatSuggestedFollowup" data-followup="'+safeText(x)+'">'+safeText(x)+'</button>').join('')+'</div>';
-      }
-      html+='<div class="chatAnswerActions"><button class="chatFollowup">Ask a follow-up</button><button class="chatSaveNote">Save to AI Notes</button></div>';
-      node.innerHTML=html;
-      bindEvidenceButtons(node);
-      node.querySelectorAll('.chatSuggestedFollowup').forEach(btn=>btn.addEventListener('click',()=>{
-        const input=$('#askInput');if(!input)return;
-        input.value=btn.dataset.followup||'';input.focus();
-      }));
-      node.querySelector('.chatFollowup')?.addEventListener('click',()=>$('#askInput')?.focus());
-      node.querySelector('.chatSaveNote')?.addEventListener('click',()=>{
-        noteItems.unshift({type:'AI Notes',title:'AI Q&A · '+d.heading,text:d.main,quote:used.map((e,i)=>'['+(i+1)+'] P.'+e.page+' '+excerpt(e.text,100)).join('\n'),page:used[0]?.page||page||1,source:activePaper?.title||'Current paper',paperId:key,evidence:used,createdAt:'Just now'});
-        toast('✓ Saved to AI Notes');
-      });
-      root.scrollTop=root.scrollHeight;
-    }catch(err){
-      node.innerHTML='<div class="chatRole">AI</div><div class="chatAIText">Failed to read the current PDF. No unverified answer was generated. Try again later.</div>';
-      console.warn('assistant answer failed',err);
-    }
-  },wait);
-}
-
-function restorePaperChatHistory(root=$('#assistantConversation')){
-  if(!root||!activePaper)return;
-  const key=activePaper?.id||activePaper?.title||'mock';
-  const turns=assistantChatHistory.filter(x=>(x.paperId||x.source)===key||x.source===activePaper?.title);
-  if(!turns.length)return;
-  let html='';
-  turns.forEach(turn=>{
-    if(turn.role==='user'){
-      html+='<div class="chatTurn userTurn"><div class="chatRole">You</div><div class="chatBubble">'+safeText(turn.question)+'</div></div>';
-      return;
-    }
-    html+='<div class="chatTurn aiTurn"><div class="chatRole">AI · '+safeText(turn.heading||'Answer')+' <span class="chatConfidence">Evidence confidence: '+safeText(turn.confidence||'—')+'</span></div><div class="chatAIText" style="white-space:pre-wrap">'+safeText(turn.answer||'')+'</div>';
-    (turn.evidence||[]).slice(0,5).forEach((e,i)=>{
-      html+='<div class="chatEvidence"><div class="chatEvidenceHead"><b>Source evidence '+(i+1)+'</b><span>p.'+e.page+' · '+safeText(e.section||'PDF')+'</span></div><p>“'+safeText(excerpt(e.text,240))+'”</p><button class="evidenceLocate" data-evidence-page="'+e.page+'" data-evidence-text="'+safeText(excerpt(e.text,140))+'">Locate source →</button></div>';
-    });
-    html+='</div>';
-  });
-  root.innerHTML=html;
-  bindEvidenceButtons(root);
-  root.scrollTop=root.scrollHeight;
-}
-
-/* ===== Translation synchronization override =====
-   The original translation prototype only showed a small window of cached
-   text. These handlers bind every scope to the active PDF page/text index. */
-let translationRuntime=null;
-let translationRenderToken=0;
-const translationCache=new Map();
-const translationInFlight=new Map();
-
-function syncTranslationPage(nextPage){
-  if(!translationRuntime||currentRight!=='translate')return;
-  const next=Math.max(1,+nextPage||1);
-  const label=$('#translationCurrentPage');
-  if(label)label.textContent=next;
-  const meta=$('#translationScopeMeta');
-  if(meta&&translationRuntime.scope==='page')meta.textContent=`· current page P.${next}`;
-  if(translationRuntime.scope==='page'||translationRuntime.scope==='section'){
-    clearTimeout(translationRuntime.syncTimer);
-    const sequence=++translationRuntime.syncSequence;
-    translationRuntime.syncTimer=setTimeout(()=>{
-      if(sequence===translationRuntime.syncSequence&&currentRight==='translate')renderBilingualScope(translationRuntime);
-    },160);
-  }
-}
-
-function translationPageText(paper,pageNo){
-  return cleanPdfText(paper?.pageTexts?.[pageNo]||(pageNo===1?paper?.extractedText||'':''));
-}
-function translationParagraphs(text){
-  const clean=String(text||'').replace(/\s+/g,' ').trim();
-  if(!clean)return [];
-  // Use larger bounded chunks so a full page needs far fewer network calls.
-  // Every character is retained; long sentences are split only at a nearby
-  // whitespace boundary when needed.
-  const MAX=1150,SOFT=1000;
-  const sentences=clean.split(/(?<=[.!?。！？；;])\s+/).map(x=>x.trim()).filter(Boolean);
-  const parts=[];let buffer='';
-  const pushBuffer=()=>{if(buffer){parts.push(buffer);buffer=''}};
-  const pushLong=sentence=>{
-    for(let start=0;start<sentence.length;){
-      let end=Math.min(start+SOFT,sentence.length);
-      if(end<sentence.length){
-        const boundary=sentence.lastIndexOf(' ',end);
-        if(boundary>start+Math.floor(SOFT*.55))end=boundary;
-      }
-      const chunk=sentence.slice(start,end).trim();
-      if(chunk)parts.push(chunk);
-      start=end;
-      while(sentence[start]===' ')start++;
-    }
-  };
-  sentences.forEach(sentence=>{
-    if(sentence.length>MAX){pushBuffer();pushLong(sentence);return}
-    if(buffer&&buffer.length+sentence.length+1>MAX)pushBuffer();
-    buffer=buffer?buffer+' '+sentence:sentence;
-  });
-  pushBuffer();
-  return parts.filter(Boolean);
-}
-async function translateParagraphZH(text){
   const key=cleanPdfText(text);
   if(!key)return '';
+  // Do not send passages that are already predominantly Chinese back through a translator.
+  const cjk=(key.match(/[\u3400-\u9fff]/g)||[]).length;
+  if(cjk>Math.max(8,key.length*.35))return key;
   if(translationCache.has(key))return translationCache.get(key);
   if(translationInFlight.has(key))return translationInFlight.get(key);
+
   const request=(async()=>{
-    let lastError='translate';
-    const hosts=['https://translate.googleapis.com','https://translate.google.com'];
-    for(let attempt=0;attempt<4;attempt++){
-      const controller=new AbortController();
-      const timer=setTimeout(()=>controller.abort(),12000);
-      try{
-        const host=hosts[attempt%hosts.length];
-        const u=host+'/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&ie=UTF-8&oe=UTF-8&q='+encodeURIComponent(key);
-        const r=await fetch(u,{signal:controller.signal,cache:'no-store'});
-        if(!r.ok){
-          const err=new Error('translate http '+r.status);
-          err.status=r.status;
-          throw err;
-        }
-        const j=await r.json();
-        const out=(j?.[0]||[]).map(x=>x?.[0]||'').join('').trim();
+    let errors=[];
+    // 1) Chrome 138+ desktop: official on-device Translator API. This is the
+    // primary path for the GitHub Pages demo and avoids CORS, rate limits and API keys.
+    try{
+      const translator=await getBuiltInChineseTranslator();
+      if(translator){
+        const out=String(await translator.translate(key)||'').trim();
         if(out){translationCache.set(key,out);return out}
-        throw new Error('empty translation');
-      }catch(e){
-        lastError=e?.message||'translate';
-        if(attempt<3){
-          const backoff=(e?.status===429||e?.status===403)?1100*(attempt+1):500*(attempt+1);
-          await new Promise(resolve=>setTimeout(resolve,backoff));
-        }
-      }finally{clearTimeout(timer)}
+        errors.push('Chrome Translator returned empty output');
+      }
+    }catch(err){
+      errors.push('Chrome Translator: '+(err?.message||err));
+      console.warn('Chrome on-device translation failed',err);
     }
-    console.warn('translation failed after retries',lastError);
-    return '【Translation failed for this paragraph】The source text is still shown above. Click “Retranslate current scope” to retry.';
+
+    // 2) Browser-compatible fallback. MyMemory requires q segments <=500 bytes,
+    // so translateViaMyMemory() safely chunks long academic paragraphs first.
+    try{
+      updateTranslationEngineUI('Using network translation fallback…');
+      const out=await translateViaMyMemory(key);
+      if(out){translationCache.set(key,out);return out}
+      errors.push('network fallback returned empty output');
+    }catch(err){
+      errors.push('Network fallback: '+(err?.message||err));
+      console.warn('network translation fallback failed',err);
+    }
+
+    console.warn('translation failed',errors.join(' | '));
+    return '【Translation unavailable】Chrome translation could not start and the network fallback is unavailable. Click Translate again to enable the Chrome language pack, then retry.';
   })();
   translationInFlight.set(key,request);
   try{return await request}finally{translationInFlight.delete(key)}
@@ -9446,7 +8922,7 @@ function renderTranslate(){
         <div class="bilingualHeaderTop"><span class="agentV2Badge">BILINGUAL READING</span><span class="translationSync">● Synced with PDF reading position</span></div>
         <h2>PDF to Chinese</h2>
         <p>Current Page <b id="translationCurrentPage">${current}</b> <span id="translationScopeMeta">${translationSectionLabel(activePaper,current,total,state.scope)}</span> · Source text, Chinese translation, and PDF page numbers stay linked</p>
-        <div class="translationScopeHint">“Current Page” translates all extractable text on this page; “Current Section” and “Full Paper” expand the scope. The AI Assistant’s Translate action only translates selected text.</div>
+        <div class="translationScopeHint">“Current Page” translates all extractable text on this page; “Current Section” and “Full Paper” expand the scope. The AI Assistant’s Translate action only translates selected text. On desktop Chrome, the first translation may download a small on-device language pack once.</div>
         <div id="translationProgress" class="translationProgress">Reading body text from the current page…</div>
         <button id="translationRetry" class="translationRetry">Retranslate current scope</button>
       </header>
@@ -9525,7 +9001,7 @@ async function hydrateTranslations(root,token=translationRenderToken){
   const progress=root.querySelector?.('#translationProgress');
   let completed=0,failed=0;
   if(progress)progress.textContent=nodes.length?`Translating 0/${nodes.length}…`:'No translatable body text in the current scope';
-  const worker=async()=>{while(cursor<nodes.length){const node=nodes[cursor++];if(!node||node.dataset.loading)continue;if(token!==translationRenderToken)return;node.dataset.loading='1';const translated=await translateParagraphZH(node.dataset.translateText||'');if(token!==translationRenderToken)return;node.textContent=translated;node.classList.remove('translationPending');if(translated.startsWith('【Translation failed for this paragraph】')){failed++;node.classList.add('translationFailed')}completed++;if(progress)progress.textContent=`Translating ${completed}/${nodes.length}…`;if(cursor<nodes.length)await new Promise(resolve=>setTimeout(resolve,120))}};
+  const worker=async()=>{while(cursor<nodes.length){const node=nodes[cursor++];if(!node||node.dataset.loading)continue;if(token!==translationRenderToken)return;node.dataset.loading='1';const translated=await translateParagraphZH(node.dataset.translateText||'');if(token!==translationRenderToken)return;node.textContent=translated;node.classList.remove('translationPending');if(translated.startsWith('【Translation failed for this paragraph】')||translated.startsWith('【Translation unavailable】')){failed++;node.classList.add('translationFailed')}completed++;if(progress)progress.textContent=`Translating ${completed}/${nodes.length}…`;if(cursor<nodes.length)await new Promise(resolve=>setTimeout(resolve,120))}};
   // Two paced workers are intentionally used instead of three bursty workers.
   // This materially reduces 429/rate-limit failures on GitHub Pages while
   // keeping current-page translation responsive.
