@@ -4579,28 +4579,184 @@ function openAlexAbstract(inv){
 function academicFallbackResults(q){
   return [];
 }
+function normalizeAcademicPdfUrl(url){
+  let u=String(url||'').trim();
+  if(!/^https?:\/\//i.test(u))return '';
+  // OpenAlex sometimes exposes an arXiv abstract URL as the landing page.
+  // Convert it to the paper-specific PDF URL instead of reusing a demo PDF.
+  const arxiv=u.match(/^https?:\/\/(?:www\.)?arxiv\.org\/abs\/([^?#/]+)/i);
+  if(arxiv)return 'https://arxiv.org/pdf/'+arxiv[1]+'.pdf';
+  return u;
+}
+function academicPdfCandidates(work){
+  const locs=[work?.best_oa_location,work?.primary_location,...(Array.isArray(work?.locations)?work.locations:[])].filter(Boolean);
+  const out=[];
+  const add=u=>{u=normalizeAcademicPdfUrl(u);if(u&&!out.includes(u))out.push(u)};
+  locs.forEach(loc=>{
+    add(loc?.pdf_url);
+    const landing=String(loc?.landing_page_url||'');
+    if(/\.pdf(?:$|[?#])/i.test(landing)||/arxiv\.org\/abs\//i.test(landing))add(landing);
+  });
+  return out;
+}
 async function fetchOpenAlexPapers(q){
-  const url='https://api.openalex.org/works?search='+encodeURIComponent(q)+'&per-page=12&select=id,doi,title,display_name,publication_year,cited_by_count,authorships,primary_location,abstract_inverted_index,type';
+  const url='https://api.openalex.org/works?search='+encodeURIComponent(q)+'&per-page=12';
   const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8500);
   try{
     const r=await fetch(url,{signal:controller.signal,headers:{'Accept':'application/json'}});
     clearTimeout(timer);
     if(!r.ok)throw new Error('OpenAlex '+r.status);
     const j=await r.json();
-    return (j.results||[]).map(x=>({
-      title:x.display_name||x.title||'Untitled',
-      abstract:openAlexAbstract(x.abstract_inverted_index)||'OpenAlex does not currently provide an abstract. Open the source for details.',
-      year:x.publication_year||'—',
-      authors:(x.authorships||[]).slice(0,4).map(a=>a.author?.display_name).filter(Boolean),
-      citations:x.cited_by_count||0,
-      source:x.primary_location?.source?.display_name||x.type||'OpenAlex',
-      doi:x.doi||'',
-      url:x.primary_location?.landing_page_url||x.doi||x.id||'',
-      isFallback:false
-    })).filter(x=>x.title);
+    return (j.results||[]).map(x=>{
+      const pdfCandidates=academicPdfCandidates(x);
+      const landing=x.best_oa_location?.landing_page_url||x.primary_location?.landing_page_url||x.doi||x.id||'';
+      return {
+        id:x.id||'',
+        title:x.display_name||x.title||'Untitled',
+        abstract:openAlexAbstract(x.abstract_inverted_index)||'OpenAlex does not currently provide an abstract. Open the source for details.',
+        year:x.publication_year||'—',
+        authors:(x.authorships||[]).slice(0,4).map(a=>a.author?.display_name).filter(Boolean),
+        citations:x.cited_by_count||0,
+        source:x.best_oa_location?.source?.display_name||x.primary_location?.source?.display_name||x.type||'OpenAlex',
+        doi:x.doi||'',
+        url:landing,
+        pdfUrl:pdfCandidates[0]||'',
+        pdfCandidates,
+        isFallback:false
+      };
+    }).filter(x=>x.title);
   }catch(e){
     clearTimeout(timer);
     return [];
+  }
+}
+
+function academicPdfFilename(title){
+  const base=String(title||'paper').replace(/[\/:*?"<>|]+/g,' ').replace(/\s+/g,' ').trim().slice(0,110)||'paper';
+  return base+'.pdf';
+}
+async function isRealPdfBlob(blob){
+  if(!blob||blob.size<5)return false;
+  try{
+    const head=new Uint8Array(await blob.slice(0,5).arrayBuffer());
+    return String.fromCharCode(...head)==='%PDF-';
+  }catch(e){return false}
+}
+function academicTitleTokens(title){
+  const stop=new Set(['with','from','into','using','based','through','towards','toward','study','paper','analysis','approach','method','methods','model','models','research','the','and','for','that','this','are','was']);
+  return [...new Set(String(title||'').toLowerCase().normalize('NFKD').replace(/[^a-z0-9\s-]/g,' ').split(/\s+/).map(x=>x.replace(/^-+|-+$/g,'')).filter(x=>x.length>=4&&!stop.has(x)))];
+}
+function academicPdfMatchesResult(paper,result){
+  const text=String(paper?.extractedText||'').toLowerCase().normalize('NFKD').replace(/[^a-z0-9\s./:-]/g,' ').slice(0,24000);
+  // If the PDF has little/no extractable text (e.g. scanned first page), do
+  // not fabricate a mismatch. The direct OpenAlex association is still used.
+  if(text.replace(/\s+/g,' ').trim().length<220)return true;
+  const doi=String(result?.doi||'').replace(/^https?:\/\/(?:dx\.)?doi\.org\//i,'').toLowerCase();
+  if(doi&&text.includes(doi))return true;
+  const tokens=academicTitleTokens(result?.title);
+  if(tokens.length<3)return true;
+  const matched=tokens.filter(t=>text.includes(t)).length;
+  const ratio=matched/tokens.length;
+  // Reject only a clear mismatch; minor punctuation/subtitle differences are OK.
+  return ratio>=0.30||matched>=Math.min(4,tokens.length);
+}
+async function attachAcademicPdf(paper,result){
+  const candidates=[...(result?.pdfCandidates||[]),result?.pdfUrl].map(normalizeAcademicPdfUrl).filter((u,i,a)=>u&&a.indexOf(u)===i);
+  const mismatched=new Set();
+  let lastError=null;
+  for(const pdfUrl of candidates){
+    let localObjectUrl='';
+    try{
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),18000);
+      const response=await fetch(pdfUrl,{signal:controller.signal,mode:'cors',credentials:'omit',redirect:'follow'});
+      clearTimeout(timer);
+      if(!response.ok)throw new Error('PDF HTTP '+response.status);
+      const blob=await response.blob();
+      if(blob.size>45*1024*1024)throw new Error('PDF is larger than 45 MB');
+      if(!(await isRealPdfBlob(blob)))throw new Error('The retrieved resource is not a PDF');
+      const file=new File([blob],academicPdfFilename(result.title),{type:'application/pdf'});
+      localObjectUrl=URL.createObjectURL(file);
+      paper.url=localObjectUrl;
+      paper.file=file;
+      paper.remotePdf=false;
+      paper.academicPdfUrl=pdfUrl;
+      await parseUploadedPdf(paper,file);
+      if(!academicPdfMatchesResult(paper,result)){
+        const mismatch=new Error('PDF title/content does not match the selected search result');
+        mismatch.code='ACADEMIC_PDF_MISMATCH';
+        throw mismatch;
+      }
+      paper.processing=false;
+      return true;
+    }catch(err){
+      lastError=err;
+      if(err?.code==='ACADEMIC_PDF_MISMATCH')mismatched.add(pdfUrl);
+      if(localObjectUrl)try{URL.revokeObjectURL(localObjectUrl)}catch(e){}
+      paper.url=null;paper.file=null;paper.pdfDoc=null;paper.remotePdf=false;paper.pageCount=1;
+      paper.pageTexts={1:result?.abstract||''};paper.extractedText=result?.abstract||'';paper.indexReady=false;
+      console.warn('Academic PDF candidate could not be loaded',pdfUrl,err);
+    }
+  }
+  // A host may block JS fetch/PDF.js but still allow normal browser PDF
+  // navigation. Only use candidates that were NOT proven to mismatch.
+  const direct=candidates.find(u=>!mismatched.has(u))||'';
+  if(direct){
+    paper.url=direct;
+    paper.file={name:academicPdfFilename(result.title),remote:true};
+    paper.remotePdf=true;
+    paper.academicPdfUrl=direct;
+    paper.pdfDoc=null;
+    paper.pageCount=1;
+    paper.parseMode='remote';
+    paper.processing=false;
+    return false;
+  }
+  paper.processing=false;
+  paper.pdfUnavailable=true;
+  throw lastError||new Error('No verified open-access PDF is available for this paper');
+}
+async function addAcademicPaperToLibrary(result,query,button){
+  if(!result)return;
+  const duplicate=papers.find(p=>(result.id&&p.academicWorkId===result.id)||(result.doi&&p.doi===result.doi));
+  if(duplicate){button?.classList.add('added');if(button)button.textContent='Added';toast('This paper is already in your library');return}
+  if(!result.pdfUrl&&!result.pdfCandidates?.length){
+    toast('No open-access PDF is available for this result. Use Open source instead.');
+    return;
+  }
+  if(button){button.disabled=true;button.textContent='Loading PDF…'}
+  const paper={
+    id:'academic-'+Date.now()+'-'+Math.random().toString(36).slice(2,7),
+    academicWorkId:result.id||'',
+    title:result.title,
+    author:(result.authors||[]).join(', '),
+    year:result.year,
+    status:'unread',
+    processing:true,
+    inKnowledgeBase:false,
+    url:null,
+    academicUrl:result.url||'',
+    academicPdfUrl:result.pdfUrl||'',
+    doi:result.doi||'',
+    source:result.source||'Academic Search',
+    searchKeyword:query,
+    extractedText:result.abstract||'',
+    pageTexts:{1:result.abstract||''},
+    pageCount:1,
+    fromAcademicSearch:true
+  };
+  papers.push(paper);
+  renderPapers();
+  try{
+    const parsed=await attachAcademicPdf(paper,result);
+    renderPapers();
+    if(button){button.disabled=false;button.classList.add('added');button.textContent='Added'}
+    toast(parsed?`✓ Added the correct PDF · ${paper.pageCount||1} pages`:'✓ Added the correct paper PDF link · browser preview mode');
+  }catch(err){
+    const idx=papers.indexOf(paper);if(idx>=0)papers.splice(idx,1);
+    renderPapers();
+    if(button){button.disabled=false;button.textContent='Add to Paper Library'}
+    toast('This paper has no verifiable PDF to open. Nothing incorrect was added.');
   }
 }
 function renderAcademicResults(q,items,online=true){
@@ -4613,7 +4769,7 @@ function renderAcademicResults(q,items,online=true){
   box.innerHTML=`
     <div class="academicSearchMeta">
       <div><b>${online?'Academic search results':'Local search suggestions'}</b><span>「${safeText(q)}」 · ${items.length} papers</span></div>
-      <span>${online?'Source: OpenAlex · ranked by relevance':'Online search is temporarily unavailable'}</span>
+      <span>${online?'Source: OpenAlex · each PDF is bound to its own search result':'Online search is temporarily unavailable'}</span>
     </div>
     <section class="academicAIInsight" id="academicAIInsight">
       <div class="academicAIInsightHead">
@@ -4636,13 +4792,15 @@ function renderAcademicResults(q,items,online=true){
                 <span>${safeText(r.source||'Academic')}</span>
                 ${Number.isFinite(+r.citations)?`<span>Cited ${r.citations}</span>`:''}
                 ${r.doi?'<span>DOI</span>':''}
+                ${r.pdfUrl?'<span>Open PDF</span>':'<span>Source only</span>'}
               </div>
             </div>
           </div>
           <div class="academicResultActions">
             ${r.url?`<button class="lightBtn" data-open-academic="${i}">Open source ↗</button>`:''}
+            ${r.pdfUrl?`<button class="lightBtn" data-open-academic-pdf="${i}">Open PDF ↗</button>`:''}
             <button class="lightBtn" data-save-academic="${i}">Save</button>
-            <button class="darkBtn" data-add-academic="${i}">Add to Paper Library</button>
+            <button class="darkBtn" data-add-academic="${i}" ${r.pdfUrl?'':'disabled'}>${r.pdfUrl?'Add to Paper Library':'PDF unavailable'}</button>
           </div>
         </article>`).join('')}
     </div>`;
@@ -4651,33 +4809,18 @@ function renderAcademicResults(q,items,online=true){
     const r=items[+b.dataset.openAcademic];
     if(r?.url)window.open(r.url,'_blank','noopener');
   });
+  $$('[data-open-academic-pdf]').forEach(b=>b.onclick=()=>{
+    const r=items[+b.dataset.openAcademicPdf];
+    if(r?.pdfUrl)window.open(r.pdfUrl,'_blank','noopener');
+  });
   $$('[data-save-academic]').forEach(b=>b.onclick=()=>{
     const r=items[+b.dataset.saveAcademic];
     toast(`✓ Saved “${excerpt(r.title,34)}”`);
   });
-  $$('[data-add-academic]').forEach(b=>b.onclick=()=>{
-    if(b.classList.contains('added'))return;
+  $$('[data-add-academic]').forEach(b=>b.onclick=async()=>{
+    if(b.classList.contains('added')||b.disabled)return;
     const r=items[+b.dataset.addAcademic];
-    papers.push({
-      id:'academic-'+Date.now()+'-'+b.dataset.addAcademic,
-      title:r.title,
-      author:(r.authors||[]).join(', '),
-      year:r.year,
-      status:'unread',
-      processing:false,
-      url:null,
-      academicUrl:r.url||'',
-      doi:r.doi||'',
-      source:r.source||'Academic Search',
-      searchKeyword:q,
-      extractedText:r.abstract||'',
-      pageTexts:{1:r.abstract||''},
-      pageCount:1,
-      fromAcademicSearch:true
-    });
-    b.classList.add('added'); b.textContent='Added';
-    renderPapers();
-    toast('✓ Added to paper library');
+    await addAcademicPaperToLibrary(r,q,b);
   });
   bindAcademicLocalAnalysis(q,items);
 }
@@ -4762,6 +4905,29 @@ async function estimatePdfPages(file){
   }catch(e){return 1}
 }
 
+function pdfTextContentToString(textContent){
+  const items=Array.isArray(textContent?.items)?textContent.items:[];
+  let out='',lastY=null;
+  for(const item of items){
+    const part=String(item?.str||'');
+    if(!part)continue;
+    const y=Number(item?.transform?.[5]);
+    const movedLine=Number.isFinite(y)&&Number.isFinite(lastY)&&Math.abs(y-lastY)>3.5;
+    if(out){
+      if(movedLine)out+='\n';
+      else if(!/\s$/.test(out)&&!/^[,.;:!?%)\]}>]/.test(part))out+=' ';
+    }
+    out+=part;
+    if(item?.hasEOL)out+='\n';
+    if(Number.isFinite(y))lastY=y;
+  }
+  // Repair common PDF line-wrap hyphenation without deleting real hyphens.
+  return out
+    .replace(/([A-Za-z])-[ \t]*\n[ \t]*([a-z])/g,'$1$2')
+    .replace(/[ \t]+\n/g,'\n')
+    .replace(/\n{3,}/g,'\n\n')
+    .trim();
+}
 async function ensurePdfPageText(paper,pageNo){
   if(!paper?.pdfDoc)return '';
   // Empty extraction may be a transient PDF.js failure. Only reuse a cached
@@ -4770,11 +4936,12 @@ async function ensurePdfPageText(paper,pageNo){
   if(paper.pageTexts?.[pageNo]!==undefined && String(paper.pageTexts[pageNo]||'').trim())return paper.pageTexts[pageNo];
   try{
     const pg=await paper.pdfDoc.getPage(pageNo);
-    const tc=await pg.getTextContent();
-    const txt=cleanPdfText(tc.items.map(it=>it.str).join(' '));
+    const tc=await pg.getTextContent({normalizeWhitespace:true,disableCombineTextItems:false});
+    const txt=pdfTextContentToString(tc);
     paper.pageTexts[pageNo]=txt;
     return txt;
   }catch(e){
+    console.warn('PDF text extraction failed on page',pageNo,e);
     paper.pageTexts[pageNo]='';
     return '';
   }
@@ -5547,7 +5714,7 @@ document.addEventListener('click',e=>{if(!e.target.classList.contains('cardMenu'
 $$('#cardMenu button').forEach(b=>b.onclick=()=>{if(!activeCard)return;const a=b.dataset.menu;if(a==='open'){if(activeCard.processing)toast('Open after parsing finishes');else openPaper(activeCard)}else if(a==='delete'){const i=papers.indexOf(activeCard);if(i>=0){if(activeCard.url)URL.revokeObjectURL(activeCard.url);papers.splice(i,1)}renderPapers()}else if(a==='kb'){activeCard.inKnowledgeBase=!activeCard.inKnowledgeBase;toast(activeCard.inKnowledgeBase?'✓ Added to Knowledge Base':'Removed from Knowledge Base');}else if(a==='rename'){const n=prompt('Paper name',activeCard.title);if(n){activeCard.title=n;renderPapers()}}$('#cardMenu').classList.remove('show')});
 
 /* Reader */
-function openPaper(p){activePaper=p;markPaperRead(p);renderPapers();continuousRenderKey='';disconnectContinuousObserver();homeView.style.display='none';pptView.style.display='none';readerView.style.display='block';$('#docTitle').textContent=p.title;$('#kbBtn').textContent=p.inKnowledgeBase?'✓ In Knowledge Base':'＋ Add to Knowledge Base';page=p?.file?1:8;zoom=p?.file?100:90;currentLeft=null;renderCenter();setRight('guide');renderLeft(null);window.scrollTo(0,0)}
+function openPaper(p){if(p?.fromAcademicSearch&&!p?.file&&!p?.pdfDoc){toast('No verified PDF is available for this search result. Open the source page instead.');if(p.academicUrl)window.open(p.academicUrl,'_blank','noopener');return}activePaper=p;markPaperRead(p);renderPapers();continuousRenderKey='';disconnectContinuousObserver();homeView.style.display='none';pptView.style.display='none';readerView.style.display='block';$('#docTitle').textContent=p.title;$('#kbBtn').textContent=p.inKnowledgeBase?'✓ In Knowledge Base':'＋ Add to Knowledge Base';page=(p?.file||p?.fromAcademicSearch)?1:8;zoom=(p?.file||p?.fromAcademicSearch)?100:90;currentLeft=null;renderCenter();setRight('guide');renderLeft(null);window.scrollTo(0,0)}
 function goHome(){readerView.style.display='none';pptView.style.display='none';homeView.style.display='block';renderPapers()}
 function syncPdfNavigationState(nextPage=page){
   if(!activePaper)return;
@@ -9155,30 +9322,31 @@ function translationPageText(paper,pageNo){
   return cleanPdfText(paper?.pageTexts?.[pageNo]||(pageNo===1?paper?.extractedText||'':''));
 }
 function translationParagraphs(text){
-  const clean=(text||'').replace(/\s+/g,' ').trim();
+  const clean=String(text||'').replace(/\s+/g,' ').trim();
   if(!clean)return [];
-  // Split only at punctuation followed by whitespace, then re-pack into
-  // bounded chunks. This keeps every character while avoiding URL-length
-  // limits in the browser translation request.
+  // Use larger bounded chunks so a full page needs far fewer network calls.
+  // Every character is retained; long sentences are split only at a nearby
+  // whitespace boundary when needed.
+  const MAX=1150,SOFT=1000;
   const sentences=clean.split(/(?<=[.!?。！？；;])\s+/).map(x=>x.trim()).filter(Boolean);
   const parts=[];let buffer='';
   const pushBuffer=()=>{if(buffer){parts.push(buffer);buffer=''}};
-  sentences.forEach(sentence=>{
-    if(sentence.length>480){
-      pushBuffer();
-      for(let start=0;start<sentence.length;){
-        let end=Math.min(start+420,sentence.length);
-        if(end<sentence.length){
-          const boundary=sentence.lastIndexOf(' ',end);
-          if(boundary>start+160)end=boundary;
-        }
-        parts.push(sentence.slice(start,end).trim());
-        start=end;
-        while(sentence[start]===' ')start++;
+  const pushLong=sentence=>{
+    for(let start=0;start<sentence.length;){
+      let end=Math.min(start+SOFT,sentence.length);
+      if(end<sentence.length){
+        const boundary=sentence.lastIndexOf(' ',end);
+        if(boundary>start+Math.floor(SOFT*.55))end=boundary;
       }
-      return;
+      const chunk=sentence.slice(start,end).trim();
+      if(chunk)parts.push(chunk);
+      start=end;
+      while(sentence[start]===' ')start++;
     }
-    if(buffer&&buffer.length+sentence.length+1>480)pushBuffer();
+  };
+  sentences.forEach(sentence=>{
+    if(sentence.length>MAX){pushBuffer();pushLong(sentence);return}
+    if(buffer&&buffer.length+sentence.length+1>MAX)pushBuffer();
     buffer=buffer?buffer+' '+sentence:sentence;
   });
   pushBuffer();
@@ -9191,36 +9359,60 @@ async function translateParagraphZH(text){
   if(translationInFlight.has(key))return translationInFlight.get(key);
   const request=(async()=>{
     let lastError='translate';
-    for(let attempt=0;attempt<3;attempt++){
+    const hosts=['https://translate.googleapis.com','https://translate.google.com'];
+    for(let attempt=0;attempt<4;attempt++){
       const controller=new AbortController();
-      const timer=setTimeout(()=>controller.abort(),9000);
+      const timer=setTimeout(()=>controller.abort(),12000);
       try{
-        const u='https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&ie=UTF-8&oe=UTF-8&q='+encodeURIComponent(key);
-        const r=await fetch(u,{signal:controller.signal});
-        if(!r.ok)throw new Error('translate http '+r.status);
+        const host=hosts[attempt%hosts.length];
+        const u=host+'/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&ie=UTF-8&oe=UTF-8&q='+encodeURIComponent(key);
+        const r=await fetch(u,{signal:controller.signal,cache:'no-store'});
+        if(!r.ok){
+          const err=new Error('translate http '+r.status);
+          err.status=r.status;
+          throw err;
+        }
         const j=await r.json();
         const out=(j?.[0]||[]).map(x=>x?.[0]||'').join('').trim();
         if(out){translationCache.set(key,out);return out}
         throw new Error('empty translation');
       }catch(e){
         lastError=e?.message||'translate';
-        if(attempt<2)await new Promise(resolve=>setTimeout(resolve,350*(attempt+1)));
+        if(attempt<3){
+          const backoff=(e?.status===429||e?.status===403)?1100*(attempt+1):500*(attempt+1);
+          await new Promise(resolve=>setTimeout(resolve,backoff));
+        }
       }finally{clearTimeout(timer)}
     }
     console.warn('translation failed after retries',lastError);
-    return '[Translation failed] The PDF source text is preserved above. Click “Retranslate current scope” to try again.';
+    return '【Translation failed for this paragraph】The source text is still shown above. Click “Retranslate current scope” to retry.';
   })();
   translationInFlight.set(key,request);
   try{return await request}finally{translationInFlight.delete(key)}
 }
 function translationSectionInfo(paper,current,total){
-  const outline=(paper?.outlineEntries||[]).filter(x=>+x.page>=1).sort((a,b)=>+a.page-+b.page);
-  const active=outline.filter(x=>+x.page<=current).pop();
-  if(active){
-    const next=outline.find(x=>+x.page>current);
-    return {title:active.title||'Current Section',start:+active.page,end:Math.max(+active.page,Math.min(total,next?+next.page-1:total))};
+  const outline=(paper?.outlineEntries||[])
+    .filter(x=>+x.page>=1)
+    .map((x,i)=>({...x,_order:i,level:Number.isFinite(+x.level)?+x.level:0}))
+    .sort((a,b)=>(+a.page-+b.page)||(a._order-b._order));
+  let activeIndex=-1;
+  for(let i=0;i<outline.length;i++)if(+outline[i].page<=current)activeIndex=i;
+  if(activeIndex>=0){
+    const active=outline[activeIndex];
+    // A section continues through its nested subsections. Stop only when the
+    // next bookmark is at the same or a higher hierarchy level.
+    const next=outline.slice(activeIndex+1).find(x=>+x.page>+active.page&&x.level<=active.level);
+    return {
+      title:active.title||'Current Section',
+      start:+active.page,
+      end:Math.max(+active.page,Math.min(total,next?+next.page-1:total)),
+      hasOutline:true
+    };
   }
-  return {title:'Current Reading Section',start:Math.max(1,current-2),end:Math.min(total,current+2)};
+  // Do not invent a +/- page range and call it a semantic section. When the
+  // PDF has no usable bookmarks, keep Current Section grounded to the page the
+  // user is actually reading so the right panel never drifts from the PDF.
+  return {title:'Current Section (no PDF bookmarks)',start:current,end:current,hasOutline:false};
 }
 async function translationPagesForScope(paper,current,scope,total){
   if(scope==='all'){
@@ -9333,8 +9525,11 @@ async function hydrateTranslations(root,token=translationRenderToken){
   const progress=root.querySelector?.('#translationProgress');
   let completed=0,failed=0;
   if(progress)progress.textContent=nodes.length?`Translating 0/${nodes.length}…`:'No translatable body text in the current scope';
-  const worker=async()=>{while(cursor<nodes.length){const node=nodes[cursor++];if(!node||node.dataset.loading)continue;if(token!==translationRenderToken)return;node.dataset.loading='1';const translated=await translateParagraphZH(node.dataset.translateText||'');node.textContent=translated;node.classList.remove('translationPending');if(translated.startsWith('【Translation failed for this paragraph】')){failed++;node.classList.add('translationFailed')}completed++;if(progress)progress.textContent=`Translating ${completed}/${nodes.length}…`}};
-  await Promise.all([worker(),worker(),worker()]);
+  const worker=async()=>{while(cursor<nodes.length){const node=nodes[cursor++];if(!node||node.dataset.loading)continue;if(token!==translationRenderToken)return;node.dataset.loading='1';const translated=await translateParagraphZH(node.dataset.translateText||'');if(token!==translationRenderToken)return;node.textContent=translated;node.classList.remove('translationPending');if(translated.startsWith('【Translation failed for this paragraph】')){failed++;node.classList.add('translationFailed')}completed++;if(progress)progress.textContent=`Translating ${completed}/${nodes.length}…`;if(cursor<nodes.length)await new Promise(resolve=>setTimeout(resolve,120))}};
+  // Two paced workers are intentionally used instead of three bursty workers.
+  // This materially reduces 429/rate-limit failures on GitHub Pages while
+  // keeping current-page translation responsive.
+  await Promise.all([worker(),worker()]);
   if(progress&&token===translationRenderToken)progress.textContent=nodes.length?(failed?`Completed ${completed}/${nodes.length}, ${failed} paragraph(s) failed · click to retry`:`Current scope translation complete · ${nodes.length}`):'No translatable body text in the current scope';
 }
 
